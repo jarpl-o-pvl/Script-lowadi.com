@@ -1,0 +1,1360 @@
+// ==UserScript==
+// @name         Lowadi v83 (Missions & Smart Feed)
+// @namespace    http://tampermonkey.net/
+// @version      83.0
+// @description  Добавлено выполнение миссий при энергии >= 30%
+// @author       YourName
+// @match        *://*.lowadi.com/*
+// @match        *://*.howrse.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const ACTIONS_PRE = [
+        { id: 'water', name: 'Поить', kw: ['поить', 'напоить', 'water'] },
+        { id: 'groom', name: 'Чистить', kw: ['чистить', 'почистить', 'groom'] },
+        { id: 'carrot', name: 'Морковь', kw: ['морковь', 'carrot'] },
+        { id: 'mash', name: 'Смесь', kw: ['смесь', 'mash'] },
+        { id: 'pet', name: 'Ласкать', kw: ['ласкать', 'погладить', 'pet'] }
+    ];
+
+    const ACTIONS_POST = [
+        { id: 'sleep', name: 'Спать', kw: ['спать', 'сон', 'отправить спать'] },
+        { id: 'grow', name: 'Вырастить', kw: ['вырастить', 'grow'] }
+    ];
+
+    const DEFAULTS = {
+        mode: 'train',
+        feedAmount: 8,
+        oatAmount: 8,
+        walkAmount: 2,
+        beachHours: 2,
+        beachSkillUp: 'Выносливость',
+        beachSkillDown: 'Прыжки',
+        trainSkill: 'Рысь',
+        trainHours: 3,
+        kskDays: 10,
+        targetAgeLimit: 25,
+        delayAction: 1500, delayModal: 1000, loopDelay: 3000, isRunning: false,
+        enabled: { water: true, groom: true, carrot: true, mash: true, pet: true, sleep: true, grow: true, feed: true, next: true, train_action: true, walk: true, walk_beach: true, missions: true }
+    };
+
+    function loadSettings() {
+        try {
+            const raw = GM_getValue('lowadiSettings_v83', '');
+            if (!raw) return JSON.parse(JSON.stringify(DEFAULTS));
+            const p = JSON.parse(raw);
+            const m = Object.assign({}, DEFAULTS, p);
+            m.enabled = Object.assign({}, DEFAULTS.enabled, p.enabled || {});
+            return m;
+        } catch (e) { return JSON.parse(JSON.stringify(DEFAULTS)); }
+    }
+    function saveSettings() { GM_setValue('lowadiSettings_v83', JSON.stringify(settings)); }
+    let settings = loadSettings();
+
+    let isRunning = settings.isRunning;
+    let loopTimeout = null;
+    let actionCount = 0;
+
+    // ================= ПАНЕЛЬ =================
+    const panel = document.createElement('div');
+    panel.id = 'lp-panel';
+    panel.innerHTML = `
+        <div class="lp-hdr" id="lp-hdr">
+            <span class="lp-title">🐴 Lowadi <span class="lp-version">v83</span></span>
+            <button class="lp-icon" id="lp-min">—</button>
+        </div>
+        <div class="lp-body" id="lp-body">
+            <div class="lp-modes">
+                <button class="lp-mode-btn" data-mode="train">💪 Кач</button>
+                <button class="lp-mode-btn" data-mode="run">🏃 Прогон</button>
+            </div>
+            <div class="lp-status-bar">
+                <div class="lp-status-dot" id="lp-dot"></div>
+                <span id="lp-status">Готов к работе</span>
+                <button class="lp-main" id="lp-toggle"><span>▶ Старт</span></button>
+            </div>
+            <div class="lp-tabs">
+                <button class="lp-tab active" id="lp-tab-log">📋 Лог</button>
+                <button class="lp-tab" id="lp-tab-settings">⚙ Настройки</button>
+            </div>
+            <div class="lp-section visible" id="lp-log"></div>
+            <div class="lp-section" id="lp-settings"></div>
+        </div>
+    `;
+    document.body.appendChild(panel);
+
+    // ================= СТИЛИ =================
+    GM_addStyle(`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+        @keyframes springEntry {
+            0% { opacity: 0; transform: scale(0.85) translateY(20px); }
+            60% { opacity: 1; transform: scale(1.02) translateY(-5px); }
+            100% { opacity: 1; transform: scale(1) translateY(0); }
+        }
+        @keyframes logSlide {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes pulseGlow {
+            0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        }
+        @keyframes radarPulse {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7), 0 4px 15px rgba(239, 68, 68, 0.3); }
+            70% { box-shadow: 0 0 0 15px rgba(239, 68, 68, 0), 0 4px 15px rgba(239, 68, 68, 0.3); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0), 0 4px 15px rgba(239, 68, 68, 0.3); }
+        }
+        @keyframes btnShine { 100% { left: 125%; } }
+        @keyframes breatheGreen {
+            0% { box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3), inset 0 1px 0 rgba(255,255,255,0.3); }
+            50% { box-shadow: 0 4px 25px rgba(16, 185, 129, 0.6), inset 0 1px 0 rgba(255,255,255,0.3); }
+            100% { box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3), inset 0 1px 0 rgba(255,255,255,0.3); }
+        }
+        @keyframes checkPop {
+            0% { transform: translate(-50%, -50%) scale(0); }
+            80% { transform: translate(-50%, -50%) scale(1.2); }
+            100% { transform: translate(-50%, -50%) scale(1); }
+        }
+        @keyframes atmosphereRotate {
+            0% { transform: rotate(0deg) scale(1); }
+            50% { transform: rotate(180deg) scale(1.2); }
+            100% { transform: rotate(360deg) scale(1); }
+        }
+
+        #lp-panel {
+            position: fixed; top: 20px; right: 20px; width: 340px;
+            background: linear-gradient(135deg, rgba(10, 10, 15, 0.7), rgba(15, 15, 20, 0.85));
+            backdrop-filter: blur(50px) saturate(180%) contrast(110%); 
+            -webkit-backdrop-filter: blur(50px) saturate(180%) contrast(110%);
+            color: #f8fafc; 
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            border-right: 1px solid rgba(255, 255, 255, 0.05);
+            box-shadow: 
+                0 40px 80px rgba(0, 0, 0, 0.8), 
+                inset 0 1px 1px rgba(255, 255, 255, 0.3),
+                inset 0 -1px 1px rgba(0, 0, 0, 0.5);
+            border-radius: 24px; font-family: 'Inter', 'Segoe UI', sans-serif;
+            font-size: 13px; z-index: 99999; user-select: none; overflow: hidden;
+            animation: springEntry 0.8s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+            isolation: isolate;
+        }
+
+        #lp-panel::before {
+            content: '';
+            position: absolute;
+            top: -50%; left: -50%; width: 200%; height: 200%;
+            background: 
+                radial-gradient(circle at 30% 30%, rgba(59, 130, 246, 0.15), transparent 40%),
+                radial-gradient(circle at 70% 80%, rgba(16, 185, 129, 0.1), transparent 40%),
+                radial-gradient(circle at 50% 50%, rgba(139, 92, 246, 0.1), transparent 50%);
+            z-index: -1;
+            animation: atmosphereRotate 25s linear infinite;
+            pointer-events: none;
+            filter: blur(20px);
+        }
+
+        .lp-hdr {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 18px 20px; 
+            background: linear-gradient(to bottom, rgba(255,255,255,0.04), transparent);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            cursor: move; font-weight: 700; font-size: 16px; letter-spacing: 0.5px;
+            position: relative; z-index: 1;
+        }
+        
+        .lp-title { display: flex; align-items: center; gap: 8px; text-shadow: 0 2px 5px rgba(0,0,0,0.8); }
+        .lp-version { font-size: 10px; color: #e2e8f0; background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.15); padding: 2px 8px; border-radius: 8px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.2); }
+        
+        .lp-icon {
+            background: linear-gradient(135deg, rgba(255,255,255,0.08), rgba(255,255,255,0.02));
+            border: 1px solid rgba(255,255,255,0.15);
+            color: #e2e8f0; width: 30px; height: 30px; border-radius: 12px; font-size: 18px;
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer; transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            box-shadow: 0 4px 10px rgba(0,0,0,0.3), inset 0 1px 1px rgba(255,255,255,0.3);
+        }
+        .lp-icon:hover { color: #fff; background: rgba(255,255,255,0.2); transform: scale(1.1) rotate(90deg); }
+
+        .lp-body { padding: 20px; max-height: 800px; opacity: 1; overflow: hidden; transition: max-height 0.5s cubic-bezier(0.25, 1, 0.5, 1), opacity 0.4s ease, padding 0.4s ease; position: relative; z-index: 1; }
+        .lp-body.minimized { max-height: 0; opacity: 0; padding-top: 0; padding-bottom: 0; }
+
+        .lp-modes { 
+            display: flex; gap: 6px; margin-bottom: 20px; 
+            background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255,255,255,0.06); 
+            padding: 5px; border-radius: 16px; box-shadow: inset 0 2px 5px rgba(0,0,0,0.5);
+            backdrop-filter: blur(10px);
+        }
+        .lp-mode-btn { 
+            flex: 1; background: transparent; border: 1px solid transparent; color: #94a3b8; 
+            padding: 10px 0; font-size: 13px; font-weight: 600; border-radius: 12px; cursor: pointer; 
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); 
+        }
+        .lp-mode-btn:hover { color: #e2e8f0; background: rgba(255,255,255,0.05); }
+        .lp-mode-btn.active { 
+            background: linear-gradient(135deg, rgba(59, 130, 246, 0.8), rgba(37, 99, 235, 0.8)); 
+            color: #fff; 
+            border: 1px solid rgba(255,255,255,0.2);
+            box-shadow: 0 4px 15px rgba(37, 99, 235, 0.5), inset 0 1px 1px rgba(255,255,255,0.3); 
+        }
+
+        .lp-status-bar { 
+            display: flex; gap: 12px; align-items: center; margin-bottom: 20px; padding: 14px; 
+            background: rgba(0, 0, 0, 0.25); 
+            border: 1px solid rgba(255, 255, 255, 0.08); 
+            border-radius: 16px; 
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2), inset 0 1px 1px rgba(255,255,255,0.05);
+            backdrop-filter: blur(10px);
+        }
+        
+        .lp-status-dot { width: 12px; height: 12px; border-radius: 50%; background: #fbbf24; box-shadow: 0 0 12px #fbbf24; }
+        .lp-status-dot.running { background: #10b981; animation: pulseGlow 2s infinite; }
+        .lp-status-dot.stopped { background: #ef4444; box-shadow: 0 0 12px #ef4444; }
+
+        #lp-status { flex: 1; font-size: 13px; color: #e2e8f0; font-weight: 600; text-shadow: 0 1px 2px rgba(0,0,0,0.8); }
+        
+        .lp-main { 
+            position: relative; overflow: hidden; 
+            background: linear-gradient(135deg, rgba(16, 185, 129, 0.9), rgba(5, 150, 105, 0.9)); 
+            color: #fff; border: 1px solid rgba(255,255,255,0.3); 
+            padding: 10px 20px; border-radius: 12px; font-weight: 700; font-size: 13px; 
+            cursor: pointer; transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); 
+            box-shadow: 0 4px 15px rgba(16, 185, 129, 0.4), inset 0 1px 2px rgba(255,255,255,0.5); 
+            animation: breatheGreen 3s infinite ease-in-out; outline: none; 
+        }
+        .lp-main span { position: relative; z-index: 2; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+        .lp-main::before { 
+            content: ''; position: absolute; top: 0; left: -100%; width: 50%; height: 100%; 
+            background: linear-gradient(to right, rgba(255,255,255,0) 0%, rgba(255,255,255,0.6) 50%, rgba(255,255,255,0) 100%); 
+            transform: skewX(-25deg); transition: all 0.7s ease; z-index: 1; 
+        }
+        .lp-main:hover { transform: translateY(-3px) scale(1.05); box-shadow: 0 10px 25px rgba(16, 185, 129, 0.6), inset 0 1px 2px rgba(255,255,255,0.8); }
+        .lp-main:hover::before { animation: btnShine 0.8s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; }
+        .lp-main:active { transform: translateY(2px) scale(0.92); }
+        
+        .lp-main.running { 
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.9), rgba(220, 38, 38, 0.9)); 
+            animation: radarPulse 1.5s infinite; 
+            box-shadow: 0 4px 15px rgba(239, 68, 68, 0.4), inset 0 1px 2px rgba(255,255,255,0.5);
+        }
+
+        .lp-tabs { display: flex; gap: 10px; margin-bottom: 16px; }
+        .lp-tab { 
+            flex: 1; background: rgba(0, 0, 0, 0.2); border: 1px solid rgba(255, 255, 255, 0.08); 
+            color: #94a3b8; padding: 10px; font-size: 12px; font-weight: 600; border-radius: 12px; 
+            cursor: pointer; transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); 
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+        }
+        .lp-tab:hover { background: rgba(255, 255, 255, 0.08); color: #e2e8f0; transform: translateY(-2px); }
+        .lp-tab.active { 
+            background: rgba(59, 130, 246, 0.2); color: #60a5fa; border-color: rgba(59, 130, 246, 0.4); 
+            box-shadow: inset 0 0 20px rgba(59, 130, 246, 0.15), inset 0 1px 0 rgba(255,255,255,0.1);
+        }
+
+        .lp-section { 
+            display: none; padding: 16px; 
+            background: rgba(0, 0, 0, 0.3); 
+            border: 1px solid rgba(255, 255, 255, 0.08); 
+            border-radius: 16px; max-height: 380px; overflow-y: auto; 
+            box-shadow: inset 0 4px 15px rgba(0,0,0,0.5);
+        }
+        .lp-section.visible { display: block; animation: springEntry 0.6s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; }
+        
+        .lp-section::-webkit-scrollbar { width: 6px; }
+        .lp-section::-webkit-scrollbar-track { background: transparent; }
+        .lp-section::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.15); border-radius: 10px; }
+
+        #lp-log { font-family: 'JetBrains Mono', 'Consolas', monospace; font-size: 11px; color: #34d399; line-height: 1.6; }
+        #lp-log div { border-bottom: 1px solid rgba(255, 255, 255, 0.05); padding: 6px 0; animation: logSlide 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; }
+        #lp-log div:last-child { border-bottom: none; }
+
+        .s-group { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+        .s-group:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+        .s-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+        .s-row span { font-size: 13px; color: #e2e8f0; font-weight: 500; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+        
+        .s-input, select.s-input { 
+            background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(255, 255, 255, 0.1); 
+            color: #fff; padding: 8px 12px; border-radius: 10px; width: 80px; 
+            font-size: 13px; font-family: 'Inter', sans-serif; outline: none; text-align: center; 
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); 
+            box-shadow: inset 0 2px 5px rgba(0,0,0,0.5);
+            backdrop-filter: blur(5px);
+        }
+        .s-input:focus, select.s-input:focus { 
+            border-color: #3b82f6; 
+            box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.25), inset 0 2px 5px rgba(0,0,0,0.5); 
+            background: rgba(0,0,0,0.6); 
+            transform: scale(1.05);
+        }
+        select.s-input option { background: #1e1e2f; color: #fff; }
+
+        .s-check { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .s-check label { 
+            display: flex; align-items: center; gap: 10px; font-size: 12px; color: #94a3b8; cursor: pointer; 
+            padding: 10px; border-radius: 12px; 
+            background: rgba(0, 0, 0, 0.2); border: 1px solid rgba(255,255,255,0.06); 
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); 
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+        }
+        .s-check label:hover { background: rgba(255, 255, 255, 0.08); color: #f8fafc; transform: translateX(3px); border-color: rgba(255,255,255,0.15); }
+        
+        .s-check input[type="checkbox"] { 
+            appearance: none; -webkit-appearance: none; width: 18px; height: 18px; 
+            border: 2px solid rgba(255,255,255,0.2); border-radius: 6px; 
+            background: rgba(0,0,0,0.4); cursor: pointer; position: relative; 
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); 
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.4);
+        }
+        .s-check input[type="checkbox"]:hover { border-color: rgba(255,255,255,0.5); transform: scale(1.1); }
+        .s-check input[type="checkbox"]:checked { 
+            background: #3b82f6; border-color: #3b82f6; 
+            box-shadow: 0 0 12px rgba(59,130,246,0.6), inset 0 2px 4px rgba(0,0,0,0.1); 
+        }
+        .s-check input[type="checkbox"]:checked::after { 
+            content: '✓'; position: absolute; top: 50%; left: 50%; 
+            transform: translate(-50%, -50%) scale(0); color: white; font-size: 12px; font-weight: bold; 
+            animation: checkPop 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; 
+        }
+    `);
+
+    const logEl = panel.querySelector('#lp-log');
+    const settingsEl = panel.querySelector('#lp-settings');
+    const toggleBtn = panel.querySelector('#lp-toggle');
+    const statusEl = panel.querySelector('#lp-status');
+    const statusDot = panel.querySelector('#lp-dot');
+    const modeBtns = panel.querySelectorAll('.lp-mode-btn');
+
+    function log(msg) {
+        const d = document.createElement('div');
+        d.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+        logEl.appendChild(d);
+        logEl.scrollTop = logEl.scrollHeight;
+        while(logEl.childNodes.length > 50) logEl.removeChild(logEl.firstChild);
+    }
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+    modeBtns.forEach(btn => {
+        if (btn.dataset.mode === settings.mode) btn.classList.add('active');
+        btn.onclick = () => {
+            if (isRunning) { log('Сначала остановите бота.'); return; }
+            settings.mode = btn.dataset.mode;
+            saveSettings();
+            modeBtns.forEach(b => b.classList.toggle('active', b === btn));
+            log(`Режим: ${settings.mode === 'train' ? 'Кач' : 'Прогон'}`);
+        };
+    });
+
+    panel.querySelector('#lp-tab-log').onclick = () => {
+        panel.querySelector('#lp-tab-log').classList.add('active');
+        panel.querySelector('#lp-tab-settings').classList.remove('active');
+        logEl.classList.add('visible'); settingsEl.classList.remove('visible');
+    };
+    panel.querySelector('#lp-tab-settings').onclick = () => {
+        panel.querySelector('#lp-tab-settings').classList.add('active');
+        panel.querySelector('#lp-tab-log').classList.remove('active');
+        settingsEl.classList.add('visible'); logEl.classList.remove('visible');
+    };
+
+    function renderSettings() {
+        settingsEl.innerHTML = `
+            <div class="s-group">
+                <div class="s-row"><span>Корм (кг):</span><input type="number" id="s-feed" class="s-input" value="${settings.feedAmount}"></div>
+                <div class="s-row"><span>Овес (кг):</span><input type="number" id="s-oat" class="s-input" value="${settings.oatAmount}"></div>
+                <div class="s-row"><span>КСК (дней):</span>
+                    <select id="s-ksk-days" class="s-input">
+                        <option value="1" ${settings.kskDays == 1 ? 'selected' : ''}>1</option>
+                        <option value="3" ${settings.kskDays == 3 ? 'selected' : ''}>3</option>
+                        <option value="10" ${settings.kskDays == 10 ? 'selected' : ''}>10</option>
+                        <option value="12" ${settings.kskDays == 12 ? 'selected' : ''}>12</option>
+                        <option value="30" ${settings.kskDays == 30 ? 'selected' : ''}>30</option>
+                        <option value="60" ${settings.kskDays == 60 ? 'selected' : ''}>60</option>
+                    </select>
+                </div>
+                <div class="s-row"><span>Лимит возраста:</span><input type="number" id="s-age-limit" class="s-input" value="${settings.targetAgeLimit}" min="1" max="30"></div>
+                <div class="s-row"><span>Лес/Горы (ч):</span><input type="number" id="s-walk" class="s-input" value="${settings.walkAmount}"></div>
+                <div class="s-row"><span>Пляж (ч):</span><input type="number" id="s-beach-hours" class="s-input" value="${settings.beachHours}"></div>
+                <div class="s-row"><span>Пляж (+):</span><input type="text" id="s-beach-up" class="s-input" value="${settings.beachSkillUp}"></div>
+                <div class="s-row"><span>Пляж (-):</span><input type="text" id="s-beach-down" class="s-input" value="${settings.beachSkillDown}"></div>
+            </div>
+            <div class="s-group">
+                <div class="s-row"><span>Навык для трен:</span><input type="text" id="s-train-skill" class="s-input" value="${settings.trainSkill}"></div>
+                <div class="s-row"><span>Часы трен:</span><input type="number" id="s-train-hours" class="s-input" value="${settings.trainHours}"></div>
+                <div class="s-row"><span>Задержка (мс):</span><input type="number" id="s-d-action" class="s-input" value="${settings.delayAction}"></div>
+            </div>
+            <div class="s-group">
+                <div class="s-row" style="margin-bottom:10px"><span>Действия:</span></div>
+                <div class="s-check" id="s-checks"></div>
+            </div>
+        `;
+
+        const checksBox = settingsEl.querySelector('#s-checks');
+        const allActions = [
+            ...ACTIONS_PRE, 
+            { id: 'feed', name: 'Кормить' }, 
+            { id: 'walk', name: 'Лес/Горы' },
+            { id: 'walk_beach', name: 'Пляж' },
+            { id: 'train_action', name: 'Тренировки' },
+            { id: 'missions', name: 'Миссии' },
+            ...ACTIONS_POST, 
+            { id: 'next', name: 'Следующая' }
+        ];
+        
+        allActions.forEach(a => {
+            const lbl = document.createElement('label');
+            lbl.innerHTML = `<input type="checkbox" ${settings.enabled[a.id] ? 'checked' : ''} data-id="${a.id}"> ${a.name}`;
+            checksBox.appendChild(lbl);
+        });
+
+        settingsEl.querySelector('#s-feed').oninput = e => { settings.feedAmount = parseInt(e.target.value)||0; saveSettings(); };
+        settingsEl.querySelector('#s-oat').oninput = e => { settings.oatAmount = parseInt(e.target.value)||0; saveSettings(); };
+        settingsEl.querySelector('#s-ksk-days').onchange = e => { settings.kskDays = parseInt(e.target.value)||10; saveSettings(); };
+        settingsEl.querySelector('#s-age-limit').oninput = e => { settings.targetAgeLimit = parseInt(e.target.value)||25; saveSettings(); };
+        settingsEl.querySelector('#s-walk').oninput = e => { settings.walkAmount = parseInt(e.target.value)||0; saveSettings(); };
+        settingsEl.querySelector('#s-beach-hours').oninput = e => { settings.beachHours = parseInt(e.target.value)||0; saveSettings(); };
+        settingsEl.querySelector('#s-beach-up').onchange = e => { settings.beachSkillUp = e.target.value; saveSettings(); };
+        settingsEl.querySelector('#s-beach-down').onchange = e => { settings.beachSkillDown = e.target.value; saveSettings(); };
+        settingsEl.querySelector('#s-train-skill').onchange = e => { settings.trainSkill = e.target.value; saveSettings(); };
+        settingsEl.querySelector('#s-train-hours').oninput = e => { settings.trainHours = parseInt(e.target.value)||0; saveSettings(); };
+        settingsEl.querySelector('#s-d-action').oninput = e => { settings.delayAction = parseInt(e.target.value)||1500; saveSettings(); };
+        
+        settingsEl.querySelectorAll('input[data-id]').forEach(cb => {
+            cb.onchange = () => { settings.enabled[cb.dataset.id] = cb.checked; saveSettings(); };
+        });
+    }
+    renderSettings();
+
+    const hdr = panel.querySelector('#lp-hdr');
+    let drag = false, dx = 0, dy = 0;
+    hdr.addEventListener('mousedown', e => {
+        if (e.target.closest('button')) return;
+        drag = true; dx = e.clientX - panel.offsetLeft; dy = e.clientY - panel.offsetTop;
+    });
+    document.addEventListener('mousemove', e => {
+        if (!drag) return;
+        panel.style.left = (e.clientX - dx) + 'px'; panel.style.top = (e.clientY - dy) + 'px'; panel.style.right = 'auto';
+    });
+    document.addEventListener('mouseup', () => { drag = false; });
+
+    panel.querySelector('#lp-min').onclick = () => {
+        const body = panel.querySelector('#lp-body');
+        const btn = panel.querySelector('#lp-min');
+        body.classList.toggle('minimized');
+        if (body.classList.contains('minimized')) {
+            btn.textContent = '+';
+        } else {
+            btn.textContent = '—';
+        }
+    };
+
+    // ================= УТИЛИТЫ =================
+    function normalize(t) {
+        return String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+    }
+    function isVisible(el) {
+        if (!el || el.closest('#lp-panel')) return false;
+        const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1;
+    }
+    
+    function findTarget(texts) {
+        const kws = texts.map(normalize);
+        const els = document.querySelectorAll('a, button, .btn, img, input[type="submit"], td, span');
+        for (let el of els) {
+            if (!el || !isVisible(el)) continue;
+            let clickable = el;
+            if (el.tagName === 'IMG') clickable = el.closest('a, button, [onclick]') || el;
+            if (clickable.disabled || clickable.classList.contains('disabled')) continue;
+
+            let text = normalize(clickable.textContent + ' ' + (clickable.value || '') + ' ' + (clickable.title || ''));
+            if (el.tagName === 'IMG') text += ' ' + normalize(el.alt);
+            if (clickable.querySelector('img')) {
+                clickable.querySelectorAll('img').forEach(img => text += ' ' + normalize(img.alt));
+            }
+
+            for (let kw of kws) {
+                if (text.includes(kw)) return clickable;
+            }
+        }
+        return null;
+    }
+
+    async function waitForFeedButton() {
+        for (let i = 0; i < 15; i++) {
+            const btns = document.querySelectorAll('button, a, .btn, input[type="submit"]');
+            for (let btn of btns) {
+                if (!isVisible(btn)) continue;
+                if (btn.disabled || btn.classList.contains('disabled')) continue;
+                const text = normalize(btn.textContent + ' ' + (btn.value || ''));
+                if (text.includes('дать поесть') || text === 'дать') {
+                    return btn;
+                }
+            }
+            await sleep(200);
+        }
+        return null;
+    }
+
+    function fireClick(el) {
+        try {
+            el.scrollIntoView({ block: 'center' });
+            const rect = el.getBoundingClientRect();
+            const x = rect.left + rect.width / 2;
+            const y = rect.top + rect.height / 2;
+            const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
+            el.dispatchEvent(new MouseEvent('mousedown', opts));
+            el.dispatchEvent(new MouseEvent('mouseup', opts));
+            el.dispatchEvent(new MouseEvent('click', opts));
+        } catch (e) { el.click(); }
+    }
+
+    async function setScalePoint(sectionName, targetValue) {
+        const targetStr = String(targetValue);
+        const normSection = normalize(sectionName);
+
+        let sliders = Array.from(document.querySelectorAll(`[data-number="${targetStr}"]`)).filter(isVisible);
+
+        if (sliders.length === 0) {
+            const allPoints = Array.from(document.querySelectorAll('[data-number]')).filter(el => isVisible(el) && !isNaN(parseInt(el.getAttribute('data-number'))));
+            if (allPoints.length > 0) {
+                allPoints.sort((a, b) => Math.abs(parseInt(a.getAttribute('data-number')) - targetValue) - Math.abs(parseInt(b.getAttribute('data-number')) - targetValue));
+                sliders = [allPoints[0]];
+            }
+        }
+
+        if (sliders.length === 0) return false;
+
+        sliders.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+
+        if (normSection.includes('корм')) {
+            log(`📝 Клик по точке в "${sectionName}" (верхняя)`);
+            fireClick(sliders[0]);
+            return true;
+        } else if (normSection.includes('овес')) {
+            const targetEl = sliders[sliders.length - 1];
+            log(`📝 Клик по точке в "${sectionName}" (нижняя)`);
+            fireClick(targetEl);
+            return true;
+        } else {
+            log(`📝 Клик по точке ${targetStr} в "${sectionName}"`);
+            fireClick(sliders[0]);
+            return true;
+        }
+    }
+
+    async function confirmModal() {
+        const modals = document.querySelectorAll('.modal, .popup, #messageBox, .messageBox, [role="dialog"], .fancybox-container');
+        for (let modal of modals) {
+            if (!isVisible(modal)) continue;
+            const btns = modal.querySelectorAll('a, button, .btn, input[type="submit"], span.button-inner');
+            for (let btn of btns) {
+                if (!isVisible(btn)) continue;
+                const text = normalize(btn.textContent + ' ' + (btn.value || ''));
+                const isConfirmText = text.includes('подтвердить') || text.includes('принять') || text.includes('ок') || text.includes('да') || text.includes('состарить') || text.includes('тренировать') || text.includes('прогулять');
+                
+                if (isConfirmText) {
+                    log(`🔘 Подтверждаю в окне: "${text.slice(0,15)}"`);
+                    fireClick(btn);
+                    await sleep(settings.delayModal);
+                    return true;
+                }
+            }
+        }
+
+        const btns = document.querySelectorAll('a, button, .btn, input[type="submit"]');
+        for (let btn of btns) {
+            if (!isVisible(btn)) continue;
+            const text = normalize(btn.textContent + ' ' + (btn.value || ''));
+            if (text === 'играть' || text === 'поить' || text === 'чистить' || text === 'кормить' || text === 'ласкать' || text === 'морковь' || text === 'смесь') continue;
+
+            if (text.includes('подтвердить') || text.includes('принять') || text.includes('состарить')) {
+                log(`🔘 Подтверждаю: "${text.slice(0,15)}"`);
+                fireClick(btn);
+                await sleep(settings.delayModal);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ================= АНАЛИЗ ЭНЕРГИИ И ЗДОРОВЬЯ =================
+    function getEnergyLevel() {
+        const bodyText = document.body.innerText;
+        const match = bodyText.match(/(?:энергия|energy)[^\d]*(\d+)\s*%/i);
+        return match ? parseInt(match[1], 10) : 100;
+    }
+
+    function getHealthLevel() {
+        const bodyText = document.body.innerText;
+        const match = bodyText.match(/(?:здоровье|health)[^\d]*(\d+)\s*%/i);
+        return match ? parseInt(match[1], 10) : 100;
+    }
+
+    // ================= АНАЛИЗ ВОЗРАСТА =================
+    function getHorseAge() {
+        const bodyText = document.body.innerText;
+        const ageMatch = bodyText.match(/Возраст:\s*([^(\n]+)/i);
+        if (!ageMatch) return null;
+        
+        const ageStr = ageMatch[1].toLowerCase();
+        
+        if (ageStr.includes('час')) return { stage: 'hours', years: 0, months: 0 };
+        
+        if (ageStr.includes('год') || ageStr.includes('лет')) {
+            const yMatch = ageStr.match(/(\d+)\s*(год|лет|года)/);
+            const mMatch = ageStr.match(/(\d+)\s*мес/);
+            return { stage: 'years', years: yMatch ? parseInt(yMatch[1]) : 0, months: mMatch ? parseInt(mMatch[1]) : 0 };
+        }
+        
+        if (ageStr.includes('мес')) {
+            const mMatch = ageStr.match(/(\d+)\s*мес/);
+            return { stage: 'months', years: 0, months: mMatch ? parseInt(mMatch[1]) : 0 };
+        }
+        return null;
+    }
+
+    function checkAgeLimit() {
+        const ageInfo = getHorseAge();
+        if (ageInfo && ageInfo.stage === 'years' && ageInfo.years >= settings.targetAgeLimit) {
+            return true;
+        }
+        return false;
+    }
+
+    // ================= ПРОВЕРКА КУКИ =================
+    async function checkCookies() {
+        const cookieBtn = document.querySelector('#onetrust-accept-btn-handler') ||
+                          document.querySelector('button[id*="accept"]') ||
+                          findTarget(['I ACCEPT COOKIES', 'ACCEPT ALL', 'ПРИНЯТЬ', 'СОГЛАСИТЬСЯ', 'CONFIRM']);
+
+        if (cookieBtn && isVisible(cookieBtn)) {
+            log('🍪 Нажимаю кнопку принятия куки...');
+            fireClick(cookieBtn);
+            await sleep(2000);
+            return true;
+        }
+        return false;
+    }
+
+    // ================= СПЕЦИАЛЬНЫЕ ДЕЙСТВИЯ =================
+    
+    async function doMissions() {
+        const energy = getEnergyLevel();
+        if (energy < 30) {
+            log(`⏸ Энергия ${energy}% < 30%. Пропускаю миссии.`);
+            return;
+        }
+
+        let missionBtn = document.querySelector('#boutonMissionEquus');
+        if (!missionBtn) missionBtn = findTarget(['миссия', 'mission']);
+
+        if (!missionBtn || !isVisible(missionBtn)) return;
+        
+        const tooltip = normalize(missionBtn.getAttribute('data-tooltip') || '');
+        if (missionBtn.classList.contains('action-disabled') || tooltip.includes('уже выполнила') || tooltip.includes('уже выполнена')) {
+            log(`ℹ Миссия уже выполнена или недоступна.`);
+            return;
+        }
+
+        log(`🎯 Нажимаю на "Миссия"`);
+        fireClick(missionBtn);
+        await sleep(settings.delayAction);
+        await confirmModal();
+    }
+
+    async function doKSK() {
+        if (window.location.href.includes('centreInscription')) {
+            log(`🏠 На странице КСК. Ищу вариант на ${settings.kskDays} дней...`);
+            
+            const forestCheckbox = document.querySelector('#foretCheckbox');
+            if (forestCheckbox) { fireClick(forestCheckbox); await sleep(500); }
+            else { const forestLabel = findTarget(['лес']); if (forestLabel) { fireClick(forestLabel); await sleep(500); } }
+
+            const searchBtn = findTarget(['искать', 'search']);
+            if (searchBtn) { log('🔍 Нажимаю "Искать"...'); fireClick(searchBtn); await sleep(3000); }
+
+            let clicked = false;
+            let targetColIndex = -1;
+
+            const headers = document.querySelectorAll('thead th');
+            let currentIndex = 0;
+            
+            for (let th of headers) {
+                const text = normalize(th.innerText);
+                const colspan = parseInt(th.getAttribute('colspan') || 1, 10);
+                
+                if (text.includes(String(settings.kskDays)) || 
+                   (settings.kskDays === 1 && text.includes('1 день')) ||
+                   (settings.kskDays === 3 && text.includes('3 дня'))) {
+                    targetColIndex = currentIndex;
+                    log(`📍 Нашёл колонку для ${settings.kskDays} дней (индекс: ${targetColIndex})`);
+                    break;
+                }
+                currentIndex += colspan;
+            }
+
+            if (targetColIndex !== -1) {
+                const rows = document.querySelectorAll('tbody tr');
+                for (let row of rows) {
+                    const cells = row.querySelectorAll('td');
+                    let cellIndex = 0;
+                    
+                    for (let cell of cells) {
+                        const cellColspan = parseInt(cell.getAttribute('colspan') || 1, 10);
+                        if (cellIndex === targetColIndex) {
+                            const btn = cell.querySelector('button');
+                            if (btn && !btn.disabled && btn.offsetParent !== null) {
+                                log(`📝 Записываю в КСК на ${settings.kskDays} дн. (цена: ${btn.innerText.trim()})`);
+                                fireClick(btn);
+                                clicked = true;
+                                break;
+                            }
+                        }
+                        cellIndex += cellColspan;
+                    }
+                    if (clicked) break;
+                }
+            }
+
+            if (!clicked) {
+                log(`⚠ Точная колонка не найдена. Ищу любую доступную кнопку...`);
+                const rows = document.querySelectorAll('tbody tr');
+                for (let row of rows) {
+                    const btns = row.querySelectorAll('button');
+                    for (let btn of btns) {
+                        if (!btn.disabled && btn.offsetParent !== null && btn.textContent.length > 0) {
+                            log(`📝 Нажимаю первую доступную кнопку.`);
+                            fireClick(btn);
+                            clicked = true;
+                            break;
+                        }
+                    }
+                    if (clicked) break;
+                }
+            }
+
+            if (clicked) {
+                await sleep(2000);
+                await confirmModal();
+                log('✅ Лошадь в КСК. Возвращаюсь...');
+                window.history.back();
+            } else {
+                log(`⚠ Вообще не нашел ни одной кнопки записи.`);
+            }
+            return;
+        }
+
+        const isNotInKSK = document.body.innerText.includes('Зарегистрируйте свою лошадь в конноспортивном комплексе');
+        if (isNotInKSK) {
+            const kskBtn = document.querySelector('a[href*="centreInscription"]') || findTarget(['записать мою лошадь', 'записать']);
+            if (kskBtn) { log('🏠 Переход к записи в КСК...'); fireClick(kskBtn); }
+            else { log('⚠ Кнопка записи в КСК не найдена.'); }
+        } else {
+            log('✅ Лошадь уже в КСК.');
+        }
+    }
+
+    async function doPlay(hours) {
+        log(`🎮 Играть ${hours} ч...`);
+        const playBtn = findTarget(['играть', 'play', 'jouer']);
+        if (!playBtn) return;
+        
+        fireClick(playBtn);
+        await sleep(1500);
+
+        const targetStr = String(hours);
+        let foundPoint = false;
+        
+        const modalPoints = document.querySelectorAll('.modal [data-number], [id*="play"] [data-number]');
+        for (let p of modalPoints) {
+            if (p.getAttribute('data-number') === targetStr && isVisible(p)) {
+                fireClick(p); foundPoint = true; log(`✅ Выбрано ${hours} ч.`); break;
+            }
+        }
+
+        if (!foundPoint) {
+            const ranges = document.querySelectorAll('input[type="range"]');
+            for (let r of ranges) {
+                if (isVisible(r)) {
+                    r.value = hours;
+                    r.dispatchEvent(new Event('input', { bubbles: true }));
+                    r.dispatchEvent(new Event('change', { bubbles: true }));
+                    foundPoint = true; log(`✅ Ползунок установлен на ${hours} ч.`); break;
+                }
+            }
+        }
+
+        if (!foundPoint) log(`⚠ Не удалось выставить ${hours} ч.`);
+
+        await sleep(1000);
+        await confirmModal();
+        await sleep(1500);
+    }
+
+    // === ПЛЯЖ ===
+    async function doBeach() {
+        log(`🏖 Пляж (${settings.beachHours} ч, +${settings.beachSkillUp}, -${settings.beachSkillDown})...`);
+        
+        const beachTab = document.querySelector('#boutonBalade-plage') || findTarget(['пляж']);
+        if (!beachTab || !isVisible(beachTab)) {
+            log('⚠ Вкладка "Пляж" не найдена.');
+            return;
+        }
+        fireClick(beachTab);
+        await sleep(1500);
+
+        await setScalePoint('пляж', settings.beachHours);
+        await sleep(500);
+
+        const selects = document.querySelectorAll('select');
+        for (let sel of selects) {
+            if (sel.offsetParent === null) continue;
+            const parentText = normalize(sel.parentElement.innerText);
+            
+            if (parentText.includes('улучшить')) {
+                for (let opt of sel.options) {
+                    if (normalize(opt.text).includes(normalize(settings.beachSkillUp))) {
+                        sel.value = opt.value;
+                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        log(`✅ Выбран навык для улучшения: ${opt.text}`);
+                        break;
+                    }
+                }
+            } else if (parentText.includes('ухудшить')) {
+                for (let opt of sel.options) {
+                    if (normalize(opt.text).includes(normalize(settings.beachSkillDown))) {
+                        sel.value = opt.value;
+                        sel.dispatchEvent(new Event('change', { bubbles: true }));
+                        log(`✅ Выбран навык для ухудшения: ${opt.text}`);
+                        break;
+                    }
+                }
+            }
+        }
+
+        const submitBtn = document.querySelector('#walk-plage-submit') || findTarget(['прогулять']);
+        if (submitBtn) {
+            fireClick(submitBtn);
+            await sleep(1500);
+            await confirmModal();
+        }
+    }
+
+    // === УМНАЯ ТРЕНИРОВКА ===
+    async function doTraining() {
+        const energy = getEnergyLevel();
+        log(`⚡ Энергия: ${energy}%.`);
+
+        if (energy <= 40) {
+            log(`⏸ Энергия меньше 40%. Пропускаю тренировку.`);
+            return;
+        }
+
+        log(`🏋️ Тренировка: ${settings.trainSkill} (${settings.trainHours} ч)...`);
+
+        let clicked = false;
+        const trainingTab = document.querySelector('#training-tab, #tab-training, .module-training');
+        const searchArea = trainingTab || document.body;
+
+        const elements = searchArea.querySelectorAll('td, div, span');
+        for (let el of elements) {
+            if (normalize(el.innerText).includes(normalize(settings.trainSkill)) && el.innerText.length < 50) {
+                const btn = el.closest('tr')?.querySelector('a, button, .plus') || el.querySelector('a, button') || el;
+                if (btn && isVisible(btn)) {
+                    fireClick(btn);
+                    clicked = true;
+                    break;
+                }
+            }
+        }
+
+        if (!clicked) {
+            log(`⚠ Не удалось найти кнопку для навыка "${settings.trainSkill}".`);
+            return;
+        }
+
+        await sleep(1500);
+
+        await setScalePoint('трен', settings.trainHours);
+        await sleep(1000);
+
+        const trainBtn = findTarget(['тренировать']);
+        if (trainBtn) {
+            fireClick(trainBtn);
+            await sleep(1500);
+            await confirmModal();
+        } else {
+            log(`⚠ Кнопка "Тренировать" не найдена.`);
+        }
+    }
+
+    // === СЧИТЫВАНИЕ КОЛИЧЕСТВА КОРМА ИЗ ИНТЕРФЕЙСА ===
+    function getRequiredFeedAmounts(defaultFeed, defaultOat) {
+        let finalFeed = defaultFeed;
+        let finalOat = defaultOat;
+
+        const feedTargetEl = document.querySelector('.section-fourrage-target');
+        const oatTargetEl = document.querySelector('.section-avoine-target');
+
+        if (feedTargetEl) {
+            const val = parseInt(feedTargetEl.textContent.trim(), 10);
+            if (!isNaN(val)) finalFeed = val;
+        }
+        
+        if (oatTargetEl) {
+            const val = parseInt(oatTargetEl.textContent.trim(), 10);
+            if (!isNaN(val)) finalOat = val;
+        }
+
+        if (finalFeed !== defaultFeed || finalOat !== defaultOat) {
+            log(`📊 Определено из интерфейса: Корм = ${finalFeed}, Овес = ${finalOat}`);
+            return { feed: finalFeed, oat: finalOat };
+        }
+
+        const messageBlocks = document.querySelectorAll('.message, .message-content, .messageBox, .info, .alert, .message-style-1');
+        for (let block of messageBlocks) {
+            if (!isVisible(block)) continue;
+            const text = normalize(block.innerText);
+            
+            if (text.includes('фураж') || text.includes('корм')) {
+                const match = text.match(/(\d+)\s*(фуража|корма)/);
+                if (match) {
+                    const requiredAmount = parseInt(match[1], 10);
+                    const calculatedOat = Math.round(requiredAmount * 0.6);
+                    log(`⚠ Найдено предупреждение: нужно дать ${requiredAmount} фуража! Ставлю ${requiredAmount} корма и ${calculatedOat} овса.`);
+                    return { feed: requiredAmount, oat: calculatedOat };
+                }
+            }
+        }
+
+        return { feed: finalFeed, oat: finalOat };
+    }
+
+    // ================= ГЕНЕРАТОР ЗАДАЧ ПО ВОЗРАСТУ =================
+    function getTasksForAge(ageInfo) {
+        if (!ageInfo) return null;
+        
+        let tasks = [];
+        
+        if (ageInfo.stage === 'hours' || (ageInfo.stage === 'months' && ageInfo.months <= 4)) {
+            tasks = [
+                { type: 'milk', kw: ['молоко', 'milk'] },
+                { type: 'groom', kw: ['чистить', 'почистить'] },
+                { type: 'sleep', kw: ['спать', 'сон'] },
+                { type: 'grow', kw: ['вырастить'] }
+            ];
+            return { name: 'Молодняк', tasks };
+        }
+
+        if (ageInfo.stage === 'months' && ageInfo.months === 6) {
+            tasks = [
+                { type: 'feed', amount: 6 },
+                { type: 'groom', kw: ['чистить'] },
+                { type: 'sleep', kw: ['спать'] },
+                { type: 'grow', kw: ['вырастить'] }
+            ];
+            return { name: '6 месяцев', tasks };
+        }
+
+        if (ageInfo.stage === 'months' && ageInfo.months === 8) {
+            tasks = [
+                { type: 'play', hours: 8 },
+                { type: 'train' },
+                { type: 'feed', amount: 6 },
+                { type: 'pet', kw: ['ласкать'] },
+                { type: 'water', kw: ['поить'] },
+                { type: 'carrot', kw: ['морковь'] },
+                { type: 'groom', kw: ['чистить'] },
+                { type: 'sleep', kw: ['спать'] },
+                { type: 'grow', kw: ['вырастить'] }
+            ];
+            return { name: '8 месяцев', tasks };
+        }
+
+        if (ageInfo.stage === 'months' && ageInfo.months === 10) {
+            tasks = [
+                { type: 'play', hours: 10 },
+                { type: 'train' },
+                { type: 'feed', amount: 6 },
+                { type: 'pet', kw: ['ласкать'] },
+                { type: 'water', kw: ['поить'] },
+                { type: 'carrot', kw: ['морковь'] },
+                { type: 'groom', kw: ['чистить'] },
+                { type: 'sleep', kw: ['спать'] },
+                { type: 'grow', kw: ['вырастить'] }
+            ];
+            return { name: '10 месяцев', tasks };
+        }
+
+        if (ageInfo.stage === 'years' && ageInfo.years === 1 && ageInfo.months === 0) {
+            tasks = [
+                { type: 'play', hours: 10 },
+                { type: 'train' },
+                { type: 'feed', amount: 8 },
+                { type: 'pet', kw: ['ласкать'] },
+                { type: 'water', kw: ['поить'] },
+                { type: 'carrot', kw: ['морковь'] },
+                { type: 'groom', kw: ['чистить'] },
+                { type: 'sleep', kw: ['спать'] },
+                { type: 'grow', kw: ['вырастить'] }
+            ];
+            return { name: '1 год', tasks };
+        }
+
+        if (ageInfo.stage === 'years' && ageInfo.years === 1 && ageInfo.months === 2) {
+            tasks = [
+                { type: 'play', hours: 10 },
+                { type: 'play', hours: 2 },
+                { type: 'train' },
+                { type: 'feed', amount: 8 },
+                { type: 'pet', kw: ['ласкать'] },
+                { type: 'water', kw: ['поить'] },
+                { type: 'carrot', kw: ['морковь'] },
+                { type: 'groom', kw: ['чистить'] },
+                { type: 'sleep', kw: ['спать'] },
+                { type: 'grow', kw: ['вырастить'] }
+            ];
+            return { name: '1 год 2 мес', tasks };
+        }
+
+        if (ageInfo.stage === 'years' && ageInfo.years === 1 && ageInfo.months === 4) {
+            tasks = [
+                { type: 'play', hours: 8 },
+                { type: 'train' },
+                { type: 'feed', amount: 8 },
+                { type: 'pet', kw: ['ласкать'] },
+                { type: 'water', kw: ['поить'] },
+                { type: 'carrot', kw: ['морковь'] },
+                { type: 'groom', kw: ['чистить'] },
+                { type: 'sleep', kw: ['спать'] },
+                { type: 'grow', kw: ['вырастить'] }
+            ];
+            return { name: '1 год 4 мес', tasks };
+        }
+
+        return null;
+    }
+
+    // ================= ЛОГИКА =================
+    async function runCycle() {
+        if (!isRunning) return;
+        
+        try {
+            const health = getHealthLevel();
+            if (health < 20) {
+                log(`💀 ВНИМАНИЕ! Здоровье упало до ${health}%. СРОЧНАЯ ОСТАНОВКА ПРОГРАММЫ!`);
+                isRunning = false;
+                updateToggle();
+                return;
+            }
+
+            if (checkAgeLimit()) {
+                log(`🛑 Лошадь уже достигла возраста ${settings.targetAgeLimit} лет. Завершаю работу.`);
+                isRunning = false;
+                updateToggle();
+                return;
+            }
+
+            await checkCookies();
+
+            if (window.location.href.includes('centreInscription')) {
+                await doKSK();
+                return;
+            }
+
+            const isNotInKSK = document.body.innerText.includes('Зарегистрируйте свою лошадь в конноспортивном комплексе');
+            if (isNotInKSK) {
+                log('🏠 Лошадь не в КСК. Начинаю запись...');
+                await doKSK();
+                return; 
+            }
+
+            // === МИССИИ ===
+            if (settings.enabled.missions) {
+                await doMissions();
+            }
+
+            if (settings.mode === 'run') {
+                log(`=== Режим Прогон: базовый уход ===`);
+                
+                const preActions = ['water', 'groom', 'carrot', 'mash', 'pet'];
+                for (let actId of preActions) {
+                    if (!isRunning) return;
+                    if (!settings.enabled[actId]) continue;
+                    const act = ACTIONS_PRE.find(a => a.id === actId);
+                    if (!act) continue;
+
+                    const btn = findTarget(act.kw);
+                    if (btn) {
+                        log(`✓ ${act.name}`);
+                        fireClick(btn);
+                        await sleep(settings.delayAction);
+                        await confirmModal();
+                        await sleep(500);
+                    }
+                }
+
+                if (isRunning && settings.enabled.feed) {
+                    const feedBtn = findTarget(['кормить', 'покормить', 'feed']);
+                    if (feedBtn) {
+                        log('Клик: Кормить');
+                        fireClick(feedBtn);
+                        await sleep(2000); 
+                        
+                        const amounts = getRequiredFeedAmounts(settings.feedAmount, settings.oatAmount);
+                        
+                        await setScalePoint('корм', amounts.feed);
+                        await sleep(1000); 
+                        await setScalePoint('овес', amounts.oat);
+                        await sleep(1500); 
+                        
+                        const giveBtn = await waitForFeedButton();
+                        if (giveBtn) {
+                            log(`✅ Нажимаю "Дать поесть"`);
+                            fireClick(giveBtn);
+                        } else {
+                            log(`⚠ Кнопка "Дать поесть" не найдена или неактивна.`);
+                        }
+                        await sleep(settings.delayAction);
+                        await confirmModal();
+                    }
+                }
+
+                if (isRunning && settings.enabled.sleep) {
+                    const sleepBtn = findTarget(['спать', 'сон', 'отправить спать']);
+                    if (sleepBtn) {
+                        log('Клик: Спать');
+                        fireClick(sleepBtn);
+                        await sleep(settings.delayAction);
+                        await confirmModal();
+                    }
+                }
+
+                if (isRunning) {
+                    const nextBtn = document.querySelector('#nav-next') || findTarget(['далее', 'следующая']);
+                    if (nextBtn) {
+                        log('➡ Переход к следующей лошади');
+                        fireClick(nextBtn);
+                        await sleep(3000);
+                        return;
+                    }
+                }
+                return;
+            }
+
+            const ageInfo = getHorseAge();
+            const stageData = getTasksForAge(ageInfo);
+
+            if (stageData) {
+                log(`🐴 Обнаружен этап: ${stageData.name}`);
+                
+                for (let task of stageData.tasks) {
+                    if (!isRunning) return;
+                    
+                    if (task.type === 'play') {
+                        await doPlay(task.hours);
+                    } else if (task.type === 'feed') {
+                        const amounts = getRequiredFeedAmounts(task.amount, task.amount);
+                        log(`🍎 Кормить (${amounts.feed} корма / ${amounts.oat} овса)...`);
+                        const feedBtn = findTarget(['кормить']);
+                        if (feedBtn) {
+                            fireClick(feedBtn);
+                            await sleep(2000);
+                            
+                            await setScalePoint('корм', amounts.feed);
+                            await sleep(1000); 
+                            await setScalePoint('овес', amounts.oat); 
+                            await sleep(1500); 
+                            
+                            const giveBtn = await waitForFeedButton();
+                            if (giveBtn) {
+                                log(`✅ Нажимаю "Дать поесть"`);
+                                fireClick(giveBtn);
+                            } else {
+                                log(`⚠ Кнопка "Дать поесть" не найдена или неактивна.`);
+                            }
+                            await sleep(1500);
+                            await confirmModal();
+                        }
+                    } else if (task.type === 'train') {
+                        await doTraining();
+                    } else if (task.type === 'grow') {
+                        const btn = findTarget(task.kw);
+                        if (btn) {
+                            log(`✓ ${task.kw[0]}`);
+                            fireClick(btn);
+                            await sleep(settings.delayAction);
+                            await confirmModal();
+                            await sleep(1000);
+
+                            if (checkAgeLimit()) {
+                                log(`🛑 Лошадь достигла возраста ${settings.targetAgeLimit} лет. Завершаю работу.`);
+                                isRunning = false;
+                                updateToggle();
+                                return;
+                            }
+                        }
+                    } else {
+                        const btn = findTarget(task.kw);
+                        if (btn) {
+                            log(`✓ ${task.kw[0]}`);
+                            fireClick(btn);
+                            await sleep(settings.delayAction);
+                            await confirmModal();
+                            await sleep(500);
+                        }
+                    }
+                }
+            } else {
+                log(`=== Взрослая лошадь (обычный режим) ===`);
+                
+                if (isRunning && settings.enabled.walk) {
+                    const walkMenuBtn = findTarget(['прогулки', 'прогулка', 'walk']);
+                    if (walkMenuBtn) { fireClick(walkMenuBtn); await sleep(1000); }
+                    
+                    const forestBtn = document.querySelector('#buttonBalade-foret') || findTarget(['лес', 'forest']);
+                    if (forestBtn && isVisible(forestBtn)) {
+                        log('Клик: Лес');
+                        fireClick(forestBtn);
+                        await sleep(1500);
+                        await setScalePoint('прогулка', settings.walkAmount);
+                        await sleep(1000);
+                        let confirmForest = document.querySelector('#walk-foret-submit') || findTarget(['прогулять']);
+                        if (confirmForest) fireClick(confirmForest);
+                        await sleep(1500);
+                    }
+
+                    const mountainBtn = document.querySelector('#buttonBalade-montagne') || findTarget(['горы', 'mountain']);
+                    if (mountainBtn && isVisible(mountainBtn)) {
+                        log('Клик: Горы');
+                        fireClick(mountainBtn);
+                        await sleep(1500);
+                        await setScalePoint('прогулка', settings.walkAmount);
+                        await sleep(1000);
+                        let confirmMountain = document.querySelector('#walk-montagne-submit') || findTarget(['прогулять']);
+                        if (confirmMountain) fireClick(confirmMountain);
+                        await sleep(1500);
+                    }
+                }
+
+                if (isRunning && settings.enabled.walk_beach) {
+                    await doBeach();
+                }
+
+                if (isRunning && settings.enabled.train_action) {
+                    await doTraining();
+                }
+
+                for (let act of ACTIONS_PRE) {
+                    if (!isRunning) return;
+                    if (!settings.enabled[act.id]) continue;
+
+                    const btn = findTarget(act.kw);
+                    if (btn) {
+                        log(`✓ ${act.name}`);
+                        fireClick(btn);
+                        await sleep(settings.delayAction);
+                        await confirmModal();
+                        await sleep(500);
+                    }
+                }
+
+                if (isRunning && settings.enabled.feed) {
+                    const feedBtn = findTarget(['кормить', 'покормить', 'feed']);
+                    if (feedBtn) {
+                        log('Клик: Кормить');
+                        fireClick(feedBtn);
+                        await sleep(2000);
+                        
+                        const amounts = getRequiredFeedAmounts(settings.feedAmount, settings.oatAmount);
+                        
+                        await setScalePoint('корм', amounts.feed);
+                        await sleep(1000);
+                        await setScalePoint('овес', amounts.oat);
+                        await sleep(1500);
+                        
+                        const giveBtn = await waitForFeedButton();
+                        if (giveBtn) {
+                            log(`✅ Нажимаю "Дать поесть"`);
+                            fireClick(giveBtn);
+                        } else {
+                            log(`⚠ Кнопка "Дать поесть" не найдена или неактивна.`);
+                        }
+                        await sleep(settings.delayAction);
+                        await confirmModal();
+                    }
+                }
+
+                for (let act of ACTIONS_POST) {
+                    if (!isRunning) return;
+                    if (!settings.enabled[act.id]) continue;
+                    const btn = findTarget(act.kw);
+                    if (btn) {
+                        log(`✓ ${act.name}`);
+                        fireClick(btn);
+                        await sleep(settings.delayAction);
+                        await confirmModal();
+                        await sleep(500);
+                    }
+                }
+            }
+        } catch (err) {
+            log(`⚠ Ошибка: ${err.message}`);
+        } finally {
+            if (isRunning) {
+                log(`Цикл завершен. Ждем...`);
+                clearTimeout(loopTimeout);
+                loopTimeout = setTimeout(runCycle, settings.loopDelay);
+            }
+        }
+    }
+
+    function updateToggle() {
+        toggleBtn.innerHTML = isRunning ? '<span>■ Стоп</span>' : '<span>▶ Старт</span>';
+        toggleBtn.classList.toggle('running', isRunning);
+        statusEl.textContent = isRunning ? 'Работает...' : 'Готов к работе';
+        if (isRunning) statusDot.className = 'lp-status-dot running';
+        else statusDot.className = 'lp-status-dot stopped';
+        modeBtns.forEach(b => b.disabled = isRunning);
+        settings.isRunning = isRunning; saveSettings();
+    }
+
+    toggleBtn.addEventListener('click', () => {
+        if (isRunning) {
+            isRunning = false;
+            clearTimeout(loopTimeout);
+            log('⏹ Остановлено пользователем');
+        } else {
+            isRunning = true;
+            log('▶ Запуск');
+            clearTimeout(loopTimeout);
+            runCycle();
+        }
+        updateToggle();
+    });
+
+    setInterval(() => {
+        if (settings.isRunning && !loopTimeout && !isRunning) {
+            isRunning = true;
+            updateToggle();
+            runCycle();
+        }
+    }, 5000);
+
+    if (settings.isRunning) {
+        log('♻ Продолжаю...');
+        isRunning = true;
+        updateToggle();
+        setTimeout(() => { if (isRunning) runCycle(); }, 2000);
+    } else {
+        log('v83 готов. Миссии добавлены.');
+        updateToggle();
+    }
+})();
